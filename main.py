@@ -1,4 +1,4 @@
- import asyncio
+import asyncio
 import aiohttp
 import logging
 import os
@@ -215,18 +215,15 @@ def check_pair(buy_data, sell_data, buy_ex, sell_ex):
     buy_price, buy_min, buy_max, buy_banks, buy_nick, buy_trades, buy_comp = buy_data
     sell_price, sell_min, sell_max, sell_banks, sell_nick, sell_trades, sell_comp = sell_data
 
-    # Одинаковые банки
     common_banks = buy_banks & sell_banks
     if not common_banks:
         return None
 
-    # Мин сумма продажи не больше макс суммы покупки
     if sell_min > buy_max:
         return None
 
     net = round(((sell_price - buy_price) / buy_price) * 100 - 0.6, 2)
 
-    # Ключ для защиты от повторов
     key = f"{buy_ex}-{sell_ex}-{buy_price}-{sell_price}"
     if key in SEEN_DEALS:
         return None
@@ -241,12 +238,13 @@ def check_pair(buy_data, sell_data, buy_ex, sell_ex):
         "sell_nick": sell_nick,
         "buy_trades": buy_trades,
         "buy_comp": buy_comp,
-        "sell_trades": sell_trades,
-        "sell_comp": sell_comp,
-        "common_banks": common_banks,
         "buy_min": buy_min,
         "buy_max": buy_max,
+        "sell_trades": sell_trades,
+        "sell_comp": sell_comp,
         "sell_min": sell_min,
+        "sell_max": sell_max,
+        "common_banks": common_banks,
         "net": net,
         "profitable": net >= MIN_MARGIN
     }
@@ -262,12 +260,10 @@ async def scan(session):
 
     signals = []
 
-    # Binance -> Bybit
     r = check_pair(b_buy, bb_sell, "Binance", "Bybit")
     if r:
         signals.append(r)
 
-    # Bybit -> Binance
     r = check_pair(bb_buy, b_sell, "Bybit", "Binance")
     if r:
         signals.append(r)
@@ -275,26 +271,40 @@ async def scan(session):
     return signals
 
 
+def fmt_kzt(val):
+    """Форматирует сумму в KZT с разделителями"""
+    return f"{int(val):,}".replace(",", " ")
+
+
 def format_signal(s):
     banks_str = ", ".join(sorted(s["common_banks"]))
     profit_100 = round((s["sell_price"] - s["buy_price"]) * 100 * 0.994, 0)
     profit_500 = round((s["sell_price"] - s["buy_price"]) * 500 * 0.994, 0)
     icon = "🚨" if s["profitable"] else "📊"
+
+    # Рабочий диапазон — пересечение лимитов покупки и продажи
+    work_min = max(s["buy_min"], s["sell_min"])
+    work_max = min(s["buy_max"], s["sell_max"]) if s["sell_max"] else s["buy_max"]
+
     return (
         f"{icon} *АРБИТРАЖ: {s['buy_exchange']} → {s['sell_exchange']}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📥 *КУПИТЬ на {s['buy_exchange']}*\n"
-        f"   Цена: `{s['buy_price']} KZT`\n"
         f"   Продавец: {s['buy_nick']}\n"
+        f"   Цена: `{s['buy_price']} KZT`\n"
+        f"   Лимит: `{fmt_kzt(s['buy_min'])} — {fmt_kzt(s['buy_max'])} KZT`\n"
         f"   ✅ Сделок: {s['buy_trades']} | Рейтинг: {s['buy_comp']}%\n\n"
         f"📤 *ПРОДАТЬ на {s['sell_exchange']}*\n"
-        f"   Цена: `{s['sell_price']} KZT`\n"
         f"   Покупатель: {s['sell_nick']}\n"
+        f"   Цена: `{s['sell_price']} KZT`\n"
+        f"   Лимит: `{fmt_kzt(s['sell_min'])} — {fmt_kzt(s['sell_max'])} KZT`\n"
         f"   ✅ Сделок: {s['sell_trades']} | Рейтинг: {s['sell_comp']}%\n\n"
+        f"💼 *Рабочий диапазон:*\n"
+        f"   `{fmt_kzt(work_min)} — {fmt_kzt(work_max)} KZT`\n\n"
         f"🏦 *Общие банки:* {banks_str}\n"
         f"💰 *Чистая маржа: {s['net']}%*\n"
-        f"💵 Прибыль со 100 USDT: ~{profit_100} KZT\n"
-        f"💵 Прибыль с 500 USDT: ~{profit_500} KZT\n\n"
+        f"💵 Прибыль со 100 USDT: ~{fmt_kzt(profit_100)} KZT\n"
+        f"💵 Прибыль с 500 USDT: ~{fmt_kzt(profit_500)} KZT\n\n"
         f"⚠️ Проверь имя плательщика!\n"
         f"⚠️ Жди реального зачисления!\n\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}"
@@ -327,8 +337,10 @@ async def handle_command(session, text, chat_id):
             "✅ *ArbBybitBinanceBOT запущен!*\n\n"
             "Мониторю Binance ↔ Bybit P2P каждые 5 минут.\n"
             "Сигнал когда маржа ≥1% и банки совпадают.\n\n"
-            f"Фильтры продавцов: {SELLER_MIN_TRADES}+ сделок, {SELLER_MIN_COMPLETION}%+, от {SELLER_MIN_LIMIT_KZT:,} KZT\n"
-            f"Фильтры покупателей: {BUYER_MIN_TRADES}+ сделок, {BUYER_MIN_COMPLETION}%+, мин.лимит ≤{BUYER_MAX_MIN_LIMIT_KZT:,} KZT"
+            f"Фильтры продавцов: {SELLER_MIN_TRADES}+ сделок, "
+            f"{SELLER_MIN_COMPLETION}%+, от {SELLER_MIN_LIMIT_KZT:,} KZT\n"
+            f"Фильтры покупателей: {BUYER_MIN_TRADES}+ сделок, "
+            f"{BUYER_MIN_COMPLETION}%+, мин.лимит ≤{BUYER_MAX_MIN_LIMIT_KZT:,} KZT"
         )
 
     elif cmd == "/scan":
