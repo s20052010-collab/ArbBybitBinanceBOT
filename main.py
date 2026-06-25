@@ -32,7 +32,7 @@ async def send_message(session, text):
             "chat_id": CHAT_ID,
             "text": text,
             "parse_mode": "Markdown"
-        })
+        }, timeout=aiohttp.ClientTimeout(total=10))
     except Exception as e:
         logger.error(f"Send error: {e}")
 
@@ -40,7 +40,8 @@ async def send_message(session, text):
 async def get_updates(session, offset=0):
     url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     try:
-        async with session.get(url, params={"offset": offset, "timeout": 30}) as r:
+        async with session.get(url, params={"offset": offset, "timeout": 30},
+                               timeout=aiohttp.ClientTimeout(total=35)) as r:
             data = await r.json()
             return data.get("result", [])
     except:
@@ -55,7 +56,7 @@ async def binance_buy(session):
             "tradeType": "BUY", "page": 1, "rows": 20,
             "merchantCheck": False
         }, headers={"Content-Type": "application/json"},
-           timeout=aiohttp.ClientTimeout(total=10)) as r:
+           timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
             best = None
             for a in data.get("data", []):
@@ -93,7 +94,7 @@ async def binance_sell(session):
             "tradeType": "SELL", "page": 1, "rows": 20,
             "merchantCheck": False
         }, headers={"Content-Type": "application/json"},
-           timeout=aiohttp.ClientTimeout(total=10)) as r:
+           timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
             best = None
             for a in data.get("data", []):
@@ -129,7 +130,7 @@ async def bybit_buy(session):
             "tokenId": "USDT", "currencyId": "KZT",
             "side": "1", "page": "1", "size": "20"
         }, headers={"Content-Type": "application/json"},
-           timeout=aiohttp.ClientTimeout(total=10)) as r:
+           timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
             best = None
             for item in data.get("result", {}).get("items", []):
@@ -173,7 +174,7 @@ async def bybit_sell(session):
             "tokenId": "USDT", "currencyId": "KZT",
             "side": "0", "page": "1", "size": "20"
         }, headers={"Content-Type": "application/json"},
-           timeout=aiohttp.ClientTimeout(total=10)) as r:
+           timeout=aiohttp.ClientTimeout(total=8)) as r:
             data = await r.json()
             best = None
             for item in data.get("result", {}).get("items", []):
@@ -224,13 +225,11 @@ def check_pair(buy_data, sell_data, buy_ex, sell_ex):
     sell_price, sell_min, sell_max, sell_banks, sell_nick, sell_trades, sell_comp = sell_data
 
     if sell_min > buy_max:
-        logger.info(f"{buy_ex}→{sell_ex} лимит: sell_min={sell_min} > buy_max={buy_max}")
         return None
 
     net = round(((sell_price - buy_price) / buy_price) * 100 - 0.3, 2)
 
     if net < MIN_MARGIN:
-        logger.info(f"{buy_ex}→{sell_ex} маржа {net}% < {MIN_MARGIN}%")
         return None
 
     key = f"{buy_ex}-{sell_ex}-{round(buy_price, 1)}-{round(sell_price, 1)}"
@@ -260,31 +259,45 @@ def check_pair(buy_data, sell_data, buy_ex, sell_ex):
 
 
 async def scan(session):
-    b_buy, b_sell, bb_buy, bb_sell = await asyncio.gather(
+    # Все запросы параллельно с таймаутом — если Bybit не отвечает просто None
+    results = await asyncio.gather(
         binance_buy(session),
         binance_sell(session),
         bybit_buy(session),
-        bybit_sell(session)
+        bybit_sell(session),
+        return_exceptions=True
     )
 
-    logger.info(f"Binance buy={b_buy[0] if b_buy else None} sell={b_sell[0] if b_sell else None}")
-    logger.info(f"Bybit buy={bb_buy[0] if bb_buy else None} sell={bb_sell[0] if bb_sell else None}")
+    b_buy = results[0] if not isinstance(results[0], Exception) else None
+    b_sell = results[1] if not isinstance(results[1], Exception) else None
+    bb_buy = results[2] if not isinstance(results[2], Exception) else None
+    bb_sell = results[3] if not isinstance(results[3], Exception) else None
+
+    logger.info(
+        f"B_buy={b_buy[0] if b_buy else None} "
+        f"B_sell={b_sell[0] if b_sell else None} "
+        f"BB_buy={bb_buy[0] if bb_buy else None} "
+        f"BB_sell={bb_sell[0] if bb_sell else None}"
+    )
 
     signals = []
 
+    # Binance → Bybit
     r = check_pair(b_buy, bb_sell, "Binance", "Bybit")
     if r: signals.append(r)
 
+    # Bybit → Binance
     r = check_pair(bb_buy, b_sell, "Bybit", "Binance")
     if r: signals.append(r)
 
+    # Binance → Binance (если нет данных Bybit)
     r = check_pair(b_buy, b_sell, "Binance", "Binance")
     if r: signals.append(r)
 
-    return signals
+    return signals, b_buy, b_sell, bb_buy, bb_sell
 
 
-def fmt_kzt(val):
+def fmt(val):
     return f"{int(val):,}".replace(",", " ")
 
 
@@ -293,6 +306,7 @@ def format_signal(s):
     sell_banks_str = ", ".join(s["sell_banks"]) if s["sell_banks"] else "—"
     profit_100 = round((s["sell_price"] - s["buy_price"]) * 100 * 0.997, 0)
     profit_500 = round((s["sell_price"] - s["buy_price"]) * 500 * 0.997, 0)
+    profit_1000 = round((s["sell_price"] - s["buy_price"]) * 1000 * 0.997, 0)
     work_min = max(s["buy_min"], s["sell_min"])
     work_max = min(s["buy_max"], s["sell_max"]) if s["sell_max"] else s["buy_max"]
 
@@ -302,20 +316,21 @@ def format_signal(s):
         f"📥 *КУПИТЬ на {s['buy_exchange']}*\n"
         f"   Продавец: {s['buy_nick']}\n"
         f"   Цена: `{s['buy_price']} KZT`\n"
-        f"   Лимит: `{fmt_kzt(s['buy_min'])} — {fmt_kzt(s['buy_max'])} KZT`\n"
+        f"   Лимит: `{fmt(s['buy_min'])} — {fmt(s['buy_max'])} KZT`\n"
         f"   🏦 Банки: {buy_banks_str}\n"
         f"   ✅ Сделок: {s['buy_trades']} | Рейтинг: {s['buy_comp']}%\n\n"
         f"📤 *ПРОДАТЬ на {s['sell_exchange']}*\n"
         f"   Покупатель: {s['sell_nick']}\n"
         f"   Цена: `{s['sell_price']} KZT`\n"
-        f"   Лимит: `{fmt_kzt(s['sell_min'])} — {fmt_kzt(s['sell_max'])} KZT`\n"
+        f"   Лимит: `{fmt(s['sell_min'])} — {fmt(s['sell_max'])} KZT`\n"
         f"   🏦 Банки: {sell_banks_str}\n"
         f"   ✅ Сделок: {s['sell_trades']} | Рейтинг: {s['sell_comp']}%\n\n"
         f"💼 *Рабочий диапазон:*\n"
-        f"   `{fmt_kzt(work_min)} — {fmt_kzt(work_max)} KZT`\n\n"
+        f"   `{fmt(work_min)} — {fmt(work_max)} KZT`\n\n"
         f"💰 *Чистая маржа: {s['net']}%*\n"
-        f"💵 Прибыль со 100 USDT: ~{fmt_kzt(profit_100)} KZT\n"
-        f"💵 Прибыль с 500 USDT: ~{fmt_kzt(profit_500)} KZT\n\n"
+        f"💵 Прибыль со 100 USDT: ~{fmt(profit_100)} KZT\n"
+        f"💵 Прибыль с 500 USDT: ~{fmt(profit_500)} KZT\n"
+        f"💵 Прибыль с 1000 USDT: ~{fmt(profit_1000)} KZT\n\n"
         f"⚠️ Проверь имя плательщика!\n"
         f"⚠️ Жди реального зачисления!\n\n"
         f"🕐 {datetime.now().strftime('%H:%M:%S %d.%m.%Y')}"
@@ -330,12 +345,12 @@ HELP_TEXT = """
 /start — запустить мониторинг
 /scan — сканировать прямо сейчас
 /rates — текущие курсы и маржа
-/debug — полные данные с бирж
 /help — помощь
 
 Бот мониторит каждые 5 минут.
 Сигнал когда маржа ≥0.5%.
-Площадки: Binance ↔ Bybit + Binance внутри.
+Площадки: Binance ↔ Bybit.
+Если Bybit недоступен — работает Binance.
 """
 
 
@@ -349,80 +364,74 @@ async def handle_command(session, text, chat_id):
             "✅ *ArbBybitBinanceBOT запущен!*\n\n"
             "Мониторю Binance ↔ Bybit P2P каждые 5 минут.\n"
             f"Сигнал когда маржа ≥{MIN_MARGIN}%.\n\n"
-            f"Продавцы: {SELLER_MIN_TRADES}+ сделок, {SELLER_MIN_COMPLETION}%+, от {SELLER_MIN_LIMIT_KZT:,} KZT\n"
+            f"Продавцы: {SELLER_MIN_TRADES}+ сделок, {SELLER_MIN_COMPLETION}%+\n"
             f"Покупатели: {BUYER_MIN_TRADES}+ сделок, {BUYER_MIN_COMPLETION}%+\n\n"
-            "📊 Напиши /rates чтобы увидеть текущую маржу.\n"
-            "🔧 Напиши /debug для полных данных с бирж."
+            "📊 Напиши /rates для текущих курсов."
         )
 
     elif cmd == "/rates":
         await send_message(session, "📊 Получаю курсы...")
-        b_buy, b_sell, bb_buy, bb_sell = await asyncio.gather(
+        results = await asyncio.gather(
             binance_buy(session),
             binance_sell(session),
             bybit_buy(session),
-            bybit_sell(session)
+            bybit_sell(session),
+            return_exceptions=True
         )
+        b_buy = results[0] if not isinstance(results[0], Exception) else None
+        b_sell = results[1] if not isinstance(results[1], Exception) else None
+        bb_buy = results[2] if not isinstance(results[2], Exception) else None
+        bb_sell = results[3] if not isinstance(results[3], Exception) else None
 
         msg = f"📊 *ТЕКУЩИЕ КУРСЫ — {datetime.now().strftime('%H:%M:%S')}*\n"
         msg += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
 
         msg += "🟡 *Binance:*\n"
-        msg += f"   Купить: `{b_buy[0] if b_buy else '—'} KZT` ({b_buy[4] if b_buy else '—'})\n"
-        msg += f"   Продать: `{b_sell[0] if b_sell else '—'} KZT` ({b_sell[4] if b_sell else '—'})\n\n"
+        msg += f"   Купить: `{b_buy[0] if b_buy else '—'} KZT` {('— ' + b_buy[4]) if b_buy else ''}\n"
+        msg += f"   Продать: `{b_sell[0] if b_sell else '—'} KZT` {('— ' + b_sell[4]) if b_sell else ''}\n\n"
 
         msg += "🔵 *Bybit:*\n"
-        msg += f"   Купить: `{bb_buy[0] if bb_buy else '—'} KZT` ({bb_buy[4] if bb_buy else '—'})\n"
-        msg += f"   Продать: `{bb_sell[0] if bb_sell else '—'} KZT` ({bb_sell[4] if bb_sell else '—'})\n\n"
+        msg += f"   Купить: `{bb_buy[0] if bb_buy else '—'} KZT` {('— ' + bb_buy[4]) if bb_buy else ''}\n"
+        msg += f"   Продать: `{bb_sell[0] if bb_sell else '—'} KZT` {('— ' + bb_sell[4]) if bb_sell else ''}\n\n"
 
         msg += "📈 *Маржа:*\n"
-        pairs = [
+        for buy_d, sell_d, label in [
             (b_buy, bb_sell, "Binance→Bybit"),
             (bb_buy, b_sell, "Bybit→Binance"),
             (b_buy, b_sell, "Binance→Binance"),
-        ]
-        for buy_d, sell_d, label in pairs:
+        ]:
             if buy_d and sell_d:
                 net = round(((sell_d[0] - buy_d[0]) / buy_d[0]) * 100 - 0.3, 2)
                 icon = "🟢" if net >= MIN_MARGIN else "🔴"
                 msg += f"   {icon} {label}: `{net}%`\n"
+            else:
+                msg += f"   ⚪ {label}: нет данных\n"
 
         msg += f"\n_Порог сигнала: {MIN_MARGIN}%_"
         await send_message(session, msg)
 
     elif cmd == "/scan":
         await send_message(session, "🔍 Сканирую...")
-        signals = await scan(session)
+        result = await scan(session)
+        signals = result[0]
         if not signals:
+            _, b_buy, b_sell, bb_buy, bb_sell = result
+            nets = []
+            if b_buy and b_sell:
+                nets.append(f"B→B: {round(((b_sell[0]-b_buy[0])/b_buy[0])*100-0.3,2)}%")
+            if b_buy and bb_sell:
+                nets.append(f"B→BB: {round(((bb_sell[0]-b_buy[0])/b_buy[0])*100-0.3,2)}%" if bb_sell else "B→BB: нет данных")
+            if bb_buy and b_sell:
+                nets.append(f"BB→B: {round(((b_sell[0]-bb_buy[0])/bb_buy[0])*100-0.3,2)}%" if bb_buy else "BB→B: нет данных")
             await send_message(session,
-                "😔 Нет сигналов.\n"
-                "Напиши /rates чтобы увидеть текущую маржу."
+                f"😔 Нет сигналов.\n"
+                f"Текущая маржа: {' | '.join(nets)}\n"
+                f"Порог: {MIN_MARGIN}%\n\n"
+                "Продолжаю мониторинг каждые 5 минут."
             )
         else:
             for s in signals:
                 await send_message(session, format_signal(s))
-
-    elif cmd == "/debug":
-        await send_message(session, "🔧 Получаю полные данные...")
-        b_buy, b_sell, bb_buy, bb_sell = await asyncio.gather(
-            binance_buy(session),
-            binance_sell(session),
-            bybit_buy(session),
-            bybit_sell(session)
-        )
-        msg = "🔧 *DEBUG*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        for label, d in [
-            ("Binance BUY", b_buy),
-            ("Binance SELL", b_sell),
-            ("Bybit BUY", bb_buy),
-            ("Bybit SELL", bb_sell),
-        ]:
-            if d:
-                msg += (f"*{label}:* {d[0]} KZT | {d[4]} | {d[5]} сделок | {d[6]}%\n"
-                        f"   Лимит: {fmt_kzt(d[1])}—{fmt_kzt(d[2])} | Банки: {', '.join(d[3]) or '—'}\n\n")
-            else:
-                msg += f"*{label}:* нет данных\n\n"
-        await send_message(session, msg)
 
     elif cmd == "/help":
         await send_message(session, HELP_TEXT)
@@ -449,7 +458,8 @@ async def monitor_loop(session):
     while True:
         if CHAT_ID:
             try:
-                signals = await scan(session)
+                result = await scan(session)
+                signals = result[0]
                 if signals:
                     for s in signals:
                         await send_message(session, format_signal(s))
